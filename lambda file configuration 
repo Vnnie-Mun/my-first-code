@@ -1,0 +1,136 @@
+"""
+════════════════════════════════════════════════════════════════
+AI MSHAURI - AWS LAMBDA DEPLOYMENT CONFIGURATION
+════════════════════════════════════════════════════════════════
+
+This module handles:
+1. Lambda function setup and deployment
+2. API Gateway integration
+3. IAM role configuration
+4. Environment variables setup
+5. CloudWatch monitoring
+6. EventBridge triggers
+
+Deploy with AWS SAM or Terraform
+════════════════════════════════════════════════════════════════
+"""
+
+import json
+import yaml
+import os
+from typing import Dict, List
+
+# ════════════════════════════════════════════════════════════════
+# 1. AWS SAM TEMPLATE (Infrastructure as Code)
+# ════════════════════════════════════════════════════════════════
+
+SAM_TEMPLATE = """
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'AI Mshauri - AWS Bedrock Mentorship Agent'
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Runtime: python3.11
+    Environment:
+      Variables:
+        BEDROCK_MODEL_ID: anthropic.claude-3-5-sonnet-20241022
+        DYNAMODB_USERS_TABLE: !Ref UsersTable
+        DYNAMODB_CONTEXT_TABLE: !Ref ContextTable
+        DYNAMODB_LOCALS_TABLE: !Ref LocalsTable
+        S3_FEEDBACK_BUCKET: !Ref FeedbackBucket
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+Resources:
+  # ════════════════════════════════════════════════════════════
+  # LAMBDA FUNCTION
+  # ════════════════════════════════════════════════════════════
+  
+  MshuariMentorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'ai-mshauri-mentor-${Environment}'
+      CodeUri: ./src
+      Handler: mshauri_main.lambda_handler
+      Runtime: python3.11
+      
+      # IAM Role with necessary permissions
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            # Bedrock permissions
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock-runtime:InvokeModel
+              Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+            
+            # DynamoDB permissions
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:Scan
+              Resource:
+                - !GetAtt UsersTable.Arn
+                - !GetAtt ContextTable.Arn
+                - !GetAtt LocalsTable.Arn
+            
+            # S3 permissions
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub '${FeedbackBucket}/*'
+            
+            # CloudWatch permissions
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: '*'
+            
+            # Secrets Manager permissions
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
+      
+      # API Gateway integration
+      Events:
+        SautiWebhook:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MshuariApiGateway
+            Path: /mentorship
+            Method: POST
+            Auth:
+              ApiKeyRequired: true
+        
+        # EventBridge trigger (scheduled)
+        ScheduledTrigger:
+          Type: Schedule
+          Properties:
+            Schedule: 'rate(1 hour)'
+            Description: Periodic mentorship trigger
+      
+      # VPC configuration (if needed for RDS access)
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      
+      Tracing: Active  # X-Ray tracing
+  
+  #

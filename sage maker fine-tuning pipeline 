@@ -1,0 +1,580 @@
+"""
+════════════════════════════════════════════════════════════════
+AI MSHAURI - SAGEMAKER FINE-TUNING PIPELINE
+════════════════════════════════════════════════════════════════
+
+This module handles:
+1. Collect user interaction data from S3
+2. Prepare training datasets
+3. Fine-tune models in SageMaker
+4. Evaluate model performance
+5. Deploy fine-tuned models for inference
+
+The pipeline trains models on:
+- Local language datasets (Swahili, Sheng)
+- Domain-specific mentorship examples
+- User feedback and outcomes
+
+Run this as a SageMaker Processing Job or Notebook
+════════════════════════════════════════════════════════════════
+"""
+
+import json
+import pandas as pd
+import numpy as np
+import boto3
+import logging
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple
+import sagemaker
+from sagemaker.huggingface import HuggingFaceProcessor
+from sagemaker.processing import ScriptProcessor
+from sagemaker.estimator import Estimator
+from sagemaker.model import Model
+from sagemaker.predictor import Predictor
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# AWS Clients
+s3_client = boto3.client('s3')
+sm_client = boto3.client('sagemaker')
+iam_client = boto3.client('iam')
+
+# SageMaker Session
+sagemaker_session = sagemaker.Session()
+role = sagemaker.get_execution_role()
+
+# ════════════════════════════════════════════════════════════════
+# 1. DATA COLLECTION & PREPARATION
+# ════════════════════════════════════════════════════════════════
+
+class MshuariDataCollector:
+    """
+    Collects interaction data from S3 and prepares for training
+    """
+    
+    def __init__(self, s3_bucket: str):
+        self.s3_bucket = s3_bucket
+        self.s3_client = s3_client
+    
+    def collect_interactions(self, days_back: int = 30) -> pd.DataFrame:
+        """
+        Collect all user interactions from S3 feedback lake
+        
+        Args:
+            days_back: Number of days to look back
+        
+        Returns:
+            DataFrame with interactions
+        """
+        
+        logger.info(f"📊 Collecting interactions from last {days_back} days...")
+        
+        interactions = []
+        prefix = "interactions/"
+        
+        # List all objects in S3
+        paginator = self.s3_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=self.s3_bucket, Prefix=prefix)
+        
+        count = 0
+        for page in pages:
+            for obj in page.get('Contents', []):
+                try:
+                    # Download and parse interaction JSON
+                    response = self.s3_client.get_object(
+                        Bucket=self.s3_bucket,
+                        Key=obj['Key']
+                    )
+                    
+                    data = json.loads(response['Body'].read())
+                    interactions.append(data)
+                    count += 1
+                
+                except Exception as e:
+                    logger.warning(f"⚠️ Error parsing {obj['Key']}: {str(e)}")
+        
+        df = pd.DataFrame(interactions)
+        logger.info(f"✅ Collected {count} interactions")
+        
+        return df
+    
+    def prepare_training_dataset(
+        self,
+        interactions_df: pd.DataFrame
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Prepare training and validation datasets
+        
+        Args:
+            interactions_df: Raw interactions data
+        
+        Returns:
+            Tuple of (training_examples, validation_examples)
+        """
+        
+        logger.info("🔄 Preparing training dataset...")
+        
+        training_examples = []
+        
+        for _, row in interactions_df.iterrows():
+            try:
+                example = {
+                    'input': {
+                        'sauti_output': row['input'].get('sauti_output', ''),
+                        'category': row['input'].get('category', ''),
+                        'county': row['input'].get('county', ''),
+                        'persona': row.get('persona', 'farmer'),
+                        'language': row.get('language', 'sw')
+                    },
+                    'output': row['output'].get('mentorship_response', ''),
+                    'feedback': row.get('feedback', ''),
+                    'timestamp': row.get('timestamp', datetime.utcnow().isoformat())
+                }
+                
+                # Filter out low-quality examples
+                if self._is_valid_example(example):
+                    training_examples.append(example)
+            
+            except Exception as e:
+                logger.warning(f"⚠️ Skipping invalid example: {str(e)}")
+        
+        # Split into training and validation
+        split_idx = int(len(training_examples) * 0.8)
+        train_set = training_examples[:split_idx]
+        val_set = training_examples[split_idx:]
+        
+        logger.info(f"✅ Prepared {len(train_set)} training + {len(val_set)} validation examples")
+        
+        return train_set, val_set
+    
+    def _is_valid_example(self, example: Dict) -> bool:
+        """Validate training example quality"""
+        
+        # Check required fields
+        if not example['input'].get('sauti_output'):
+            return False
+        if not example['output']:
+            return False
+        
+        # Check minimum lengths
+        if len(example['input']['sauti_output']) < 20:
+            return False
+        if len(example['output']) < 30:
+            return False
+        
+        return True
+    
+    def save_training_dataset(
+        self,
+        train_examples: List[Dict],
+        val_examples: List[Dict],
+        output_prefix: str = 'training-datasets'
+    ) -> Tuple[str, str]:
+        """
+        Save training and validation datasets to S3
+        
+        Args:
+            train_examples: Training examples
+            val_examples: Validation examples
+            output_prefix: S3 prefix for output
+        
+        Returns:
+            Tuple of (train_s3_path, val_s3_path)
+        """
+        
+        logger.info("💾 Saving datasets to S3...")
+        
+        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        
+        # Save training data
+        train_key = f"{output_prefix}/train_{timestamp}.jsonl"
+        with open('/tmp/train.jsonl', 'w') as f:
+            for example in train_examples:
+                f.write(json.dumps(example) + '\n')
+        
+        self.s3_client.upload_file(
+            '/tmp/train.jsonl',
+            self.s3_bucket,
+            train_key
+        )
+        
+        # Save validation data
+        val_key = f"{output_prefix}/val_{timestamp}.jsonl"
+        with open('/tmp/val.jsonl', 'w') as f:
+            for example in val_examples:
+                f.write(json.dumps(example) + '\n')
+        
+        self.s3_client.upload_file(
+            '/tmp/val.jsonl',
+            self.s3_bucket,
+            val_key
+        )
+        
+        train_s3_path = f"s3://{self.s3_bucket}/{train_key}"
+        val_s3_path = f"s3://{self.s3_bucket}/{val_key}"
+        
+        logger.info(f"✅ Training data: {train_s3_path}")
+        logger.info(f"✅ Validation data: {val_s3_path}")
+        
+        return train_s3_path, val_s3_path
+
+# ════════════════════════════════════════════════════════════════
+# 2. MODEL FINE-TUNING
+# ════════════════════════════════════════════════════════════════
+
+class MshuariModelFinetuner:
+    """
+    Fine-tunes language models on Mshauri domain data
+    """
+    
+    def __init__(self, role_arn: str, session: sagemaker.Session = None):
+        self.role_arn = role_arn
+        self.session = session or sagemaker_session
+        self.region = self.session.boto_region_name
+    
+    def finetune_model(
+        self,
+        train_data_s3: str,
+        val_data_s3: str,
+        model_name: str = 'mshauri-mentor-model',
+        instance_count: int = 1,
+        instance_type: str = 'ml.g4dn.xlarge'
+    ) -> str:
+        """
+        Fine-tune a language model on Mshauri data
+        
+        Args:
+            train_data_s3: S3 path to training data
+            val_data_s3: S3 path to validation data
+            model_name: Name for the fine-tuned model
+            instance_count: Number of training instances
+            instance_type: Instance type for training
+        
+        Returns:
+            Model artifact S3 path
+        """
+        
+        logger.info(f"🧠 Fine-tuning model: {model_name}")
+        
+        # Training job configuration
+        job_name = f"mshauri-finetuning-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        
+        hyperparameters = {
+            'epochs': 3,
+            'batch_size': 8,
+            'learning_rate': 1e-4,
+            'warmup_ratio': 0.1,
+            'weight_decay': 0.01,
+            'max_seq_length': 512,
+            'fp16': True
+        }
+        
+        # Create HuggingFace estimator
+        huggingface_estimator = Estimator(
+            image_uri=self._get_huggingface_image_uri(),
+            role=self.role_arn,
+            instance_count=instance_count,
+            instance_type=instance_type,
+            output_path=f"s3://{sagemaker_session.default_bucket()}/mshauri-models",
+            hyperparameters=hyperparameters,
+            sagemaker_session=self.session
+        )
+        
+        # Set input channels
+        train_input = sagemaker.inputs.TrainingInput(
+            s3_data=train_data_s3,
+            content_type='application/x-recordio-protobuf'
+        )
+        val_input = sagemaker.inputs.TrainingInput(
+            s3_data=val_data_s3,
+            content_type='application/x-recordio-protobuf'
+        )
+        
+        # Start training
+        logger.info(f"🚀 Starting training job: {job_name}")
+        huggingface_estimator.fit(
+            {'train': train_input, 'validation': val_input},
+            job_name=job_name,
+            wait=True
+        )
+        
+        # Get model artifact
+        model_artifact_s3 = huggingface_estimator.model_data
+        logger.info(f"✅ Model training complete: {model_artifact_s3}")
+        
+        return model_artifact_s3
+    
+    def _get_huggingface_image_uri(self) -> str:
+        """Get HuggingFace training image URI for region"""
+        
+        image_uris = {
+            'us-east-1': '763104330519.dkr.ecr.us-east-1.amazonaws.com/huggingface-pytorch-training:2.1.0-transformers4.34.1-gpu-py310-cu118-ubuntu20.04',
+            'us-west-2': '246618743249.dkr.ecr.us-west-2.amazonaws.com/huggingface-pytorch-training:2.1.0-transformers4.34.1-gpu-py310-cu118-ubuntu20.04',
+            'eu-west-1': '685385470294.dkr.ecr.eu-west-1.amazonaws.com/huggingface-pytorch-training:2.1.0-transformers4.34.1-gpu-py310-cu118-ubuntu20.04'
+        }
+        
+        return image_uris.get(self.region, image_uris['us-east-1'])
+    
+    def deploy_model(
+        self,
+        model_artifact_s3: str,
+        model_name: str = 'mshauri-mentor-endpoint',
+        instance_type: str = 'ml.g4dn.xlarge'
+    ) -> str:
+        """
+        Deploy fine-tuned model to SageMaker endpoint
+        
+        Args:
+            model_artifact_s3: S3 path to model artifact
+            model_name: Name for the endpoint
+            instance_type: Instance type for hosting
+        
+        Returns:
+            Endpoint name
+        """
+        
+        logger.info(f"🚀 Deploying model to endpoint: {model_name}")
+        
+        # Create model
+        model = Model(
+            image_uri=self._get_inference_image_uri(),
+            model_data=model_artifact_s3,
+            role=self.role_arn,
+            sagemaker_session=self.session
+        )
+        
+        # Deploy to endpoint
+        endpoint_name = f"mshauri-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        
+        model.deploy(
+            initial_instance_count=1,
+            instance_type=instance_type,
+            endpoint_name=endpoint_name,
+            wait=True
+        )
+        
+        logger.info(f"✅ Model deployed to endpoint: {endpoint_name}")
+        
+        return endpoint_name
+    
+    def _get_inference_image_uri(self) -> str:
+        """Get HuggingFace inference image URI"""
+        
+        image_uris = {
+            'us-east-1': '763104330519.dkr.ecr.us-east-1.amazonaws.com/huggingface-pytorch-inference:2.1.0-transformers4.34.1-gpu-py310-cu118-ubuntu20.04',
+            'us-west-2': '246618743249.dkr.ecr.us-west-2.amazonaws.com/huggingface-pytorch-inference:2.1.0-transformers4.34.1-gpu-py310-cu118-ubuntu20.04',
+            'eu-west-1': '685385470294.dkr.ecr.eu-west-1.amazonaws.com/huggingface-pytorch-inference:2.1.0-transformers4.34.1-gpu-py310-cu118-ubuntu20.04'
+        }
+        
+        return image_uris.get(self.region, image_uris['us-east-1'])
+
+# ════════════════════════════════════════════════════════════════
+# 3. MODEL EVALUATION
+# ════════════════════════════════════════════════════════════════
+
+class ModelEvaluator:
+    """
+    Evaluates model performance on validation set
+    """
+    
+    def __init__(self, endpoint_name: str, session: sagemaker.Session = None):
+        self.endpoint_name = endpoint_name
+        self.session = session or sagemaker_session
+        self.predictor = Predictor(
+            endpoint_name=endpoint_name,
+            sagemaker_session=self.session
+        )
+    
+    def evaluate_on_dataset(self, val_examples: List[Dict]) -> Dict:
+        """
+        Evaluate model on validation dataset
+        
+        Args:
+            val_examples: Validation examples
+        
+        Returns:
+            Evaluation metrics
+        """
+        
+        logger.info(f"📊 Evaluating model on {len(val_examples)} examples...")
+        
+        correct_predictions = 0
+        total_predictions = 0
+        average_latency = 0
+        
+        for example in val_examples:
+            try:
+                start_time = datetime.utcnow()
+                
+                # Get prediction
+                response = self.predictor.predict(json.dumps(example['input']))
+                prediction = json.loads(response)
+                
+                latency = (datetime.utcnow() - start_time).total_seconds()
+                average_latency += latency
+                
+                # Simple evaluation: check if output contains key phrases from expected
+                if self._contains_key_phrases(prediction, example['output']):
+                    correct_predictions += 1
+                
+                total_predictions += 1
+            
+            except Exception as e:
+                logger.warning(f"⚠️ Evaluation error: {str(e)}")
+        
+        accuracy = (correct_predictions / total_predictions) if total_predictions > 0 else 0
+        avg_latency = average_latency / total_predictions if total_predictions > 0 else 0
+        
+        metrics = {
+            'accuracy': accuracy,
+            'total_predictions': total_predictions,
+            'correct_predictions': correct_predictions,
+            'average_latency_seconds': avg_latency,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        logger.info(f"✅ Evaluation complete:")
+        logger.info(f"   Accuracy: {accuracy:.2%}")
+        logger.info(f"   Latency: {avg_latency:.2f}s")
+        
+        return metrics
+    
+    def _contains_key_phrases(self, prediction: Dict, expected: str) -> bool:
+        """Check if prediction contains key phrases from expected output"""
+        
+        predicted_text = prediction.get('output', '').lower()
+        
+        # Extract key words from expected (words > 4 chars)
+        key_words = [w for w in expected.lower().split() if len(w) > 4]
+        
+        # Check if any key words are in prediction
+        matches = sum(1 for w in key_words if w in predicted_text)
+        
+        return matches >= max(1, len(key_words) // 2)
+
+# ════════════════════════════════════════════════════════════════
+# 4. COMPLETE TRAINING PIPELINE
+# ════════════════════════════════════════════════════════════════
+
+class TrainingPipeline:
+    """
+    End-to-end training pipeline
+    """
+    
+    def __init__(
+        self,
+        s3_bucket: str,
+        role_arn: str,
+        region: str = 'us-east-1'
+    ):
+        self.s3_bucket = s3_bucket
+        self.role_arn = role_arn
+        self.region = region
+        
+        self.collector = MshuariDataCollector(s3_bucket)
+        self.finetuner = MshuariModelFinetuner(role_arn)
+        
+        logger.info("🚀 Training Pipeline initialized")
+    
+    def run(self) -> Dict:
+        """
+        Run complete training pipeline
+        
+        Returns:
+            Pipeline results
+        """
+        
+        logger.info("=" * 60)
+        logger.info("🎯 MSHAURI MODEL TRAINING PIPELINE")
+        logger.info("=" * 60)
+        
+        try:
+            # Step 1: Collect data
+            logger.info("\n📊 Step 1: Collecting interaction data...")
+            interactions_df = self.collector.collect_interactions(days_back=30)
+            
+            if interactions_df.empty:
+                logger.error("❌ No interaction data found")
+                return {'status': 'error', 'message': 'No training data'}
+            
+            # Step 2: Prepare datasets
+            logger.info("\n🔄 Step 2: Preparing training datasets...")
+            train_examples, val_examples = self.collector.prepare_training_dataset(
+                interactions_df
+            )
+            
+            # Step 3: Save to S3
+            logger.info("\n💾 Step 3: Saving datasets to S3...")
+            train_s3, val_s3 = self.collector.save_training_dataset(
+                train_examples,
+                val_examples
+            )
+            
+            # Step 4: Fine-tune model
+            logger.info("\n🧠 Step 4: Fine-tuning model...")
+            model_artifact = self.finetuner.finetune_model(
+                train_s3,
+                val_s3,
+                model_name='mshauri-mentor-model'
+            )
+            
+            # Step 5: Deploy model
+            logger.info("\n🚀 Step 5: Deploying model...")
+            endpoint_name = self.finetuner.deploy_model(
+                model_artifact,
+                model_name='mshauri-mentor-endpoint'
+            )
+            
+            # Step 6: Evaluate
+            logger.info("\n📊 Step 6: Evaluating model...")
+            evaluator = ModelEvaluator(endpoint_name)
+            metrics = evaluator.evaluate_on_dataset(val_examples)
+            
+            # Final status
+            result = {
+                'status': 'success',
+                'timestamp': datetime.utcnow().isoformat(),
+                'data': {
+                    'training_examples': len(train_examples),
+                    'validation_examples': len(val_examples)
+                },
+                'model': {
+                    'artifact_s3': model_artifact,
+                    'endpoint_name': endpoint_name
+                },
+                'metrics': metrics
+            }
+            
+            logger.info("\n" + "=" * 60)
+            logger.info("✅ TRAINING PIPELINE COMPLETE")
+            logger.info("=" * 60)
+            logger.info(f"📊 Endpoint: {endpoint_name}")
+            logger.info(f"📈 Accuracy: {metrics['accuracy']:.2%}")
+            logger.info(f"⏱️  Latency: {metrics['average_latency_seconds']:.2f}s")
+            
+            return result
+        
+        except Exception as e:
+            logger.error(f"\n❌ Pipeline failed: {str(e)}")
+            return {
+                'status': 'error',
+                'error': str(e),
+                'timestamp': datetime.utcnow().isoformat()
+            }
+
+# ════════════════════════════════════════════════════════════════
+# 5. SAGEMAKER NOTEBOOK SCRIPT
+# ════════════════════════════════════════════════════════════════
+
+NOTEBOOK_SCRIPT = """
+# ════════════════════════════════════════════════════════════════
+# AI MSHAURI - SAGEMAKER NOTEBOOK
+# ════════════════════════════════════════════════════════════════
+# Run this in SageMaker Studio or Jupyter Notebook
+
+import sagemaker
+import json
+from sagemaker_
